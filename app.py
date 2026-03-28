@@ -187,6 +187,25 @@ def optimize(req: OptimizeRequest):
             remaining_l.append(int(orders[o].v))
             remaining_kg.append(0.0)
 
+    # Pre-process state.executions:
+    #   avail_l[c]     = remaining capacity in compartment c (0-based)
+    #   occupied_by[c] = set of order IDs already loaded in compartment c
+    executions = (state.executions if state and state.executions else [])
+
+    used_l: List[int] = [0] * n_c
+    occupied_by: List[set] = [set() for _ in range(n_c)]
+
+    for exe in executions:
+        c_idx = exe.compartment - 1  # convert 1-based -> 0-based
+        if 0 <= c_idx < n_c:
+            if exe.actual_volume_l is not None:
+                used_l[c_idx] += exe.actual_volume_l
+            occupied_by[c_idx].add(exe.order)
+
+    avail_l: List[int] = [
+        max(0, compartments[c].capacity - used_l[c]) for c in range(n_c)
+    ]
+
     # Build CP-SAT model
     model = cp_model.CpModel()
 
@@ -201,7 +220,7 @@ def optimize(req: OptimizeRequest):
 
             # Max liters per compartment for this order (maxfill rule)
             max_fill_l = int(cap_l * orders[o].maxfill / 100)
-            max_possible_l = min(cap_l, remaining_l[o], max_fill_l)
+            max_possible_l = min(avail_l[c], remaining_l[o], max_fill_l)
 
             # liters variable
             v_l[o, c] = model.NewIntVar(0, max_possible_l, f"vL_{o}_{c}")
@@ -225,10 +244,16 @@ def optimize(req: OptimizeRequest):
         cap_l = compartments[c].capacity
 
         # liters capacity
-        model.Add(sum(v_l[o, c] for o in range(n_orders)) <= cap_l)
+        model.Add(sum(v_l[o, c] for o in range(n_orders)) <= avail_l[c])
 
         # no blending: at most one order per compartment
         model.Add(sum(x[o, c] for o in range(n_orders)) <= 1)
+
+        # block any order not already in this compartment from being assigned to it
+        if occupied_by[c]:
+            for o in range(n_orders):
+                if orders[o].order not in occupied_by[c]:
+                    model.Add(x[o, c] == 0)
 
         # hazardous redundancy kept
         model.Add(sum(x[o, c] for o in range(n_orders) if orders[o].haz) <= 1)
